@@ -7,11 +7,12 @@ import unicodedata
 import streamlit as st
 from rapidfuzz import fuzz, process
 from openai import OpenAI
+import xml.etree.ElementTree as ET
 
 # ========= CONFIG =========
-DEFAULT_SAFE_TARGET = 10          # počet "bezpečných" návrhů ve výstupu
-ARES_COUNT = 60                   # kolik záznamů tahat z ARES pro porovnání
-UA = "cz-name-checker/1.3 (+contact: owner@example.com)"
+DEFAULT_SAFE_TARGET = 10
+ARES_COUNT = 60
+UA = "cz-name-checker/1.4 (+contact: owner@example.com)"
 
 # ========= API KEY =========
 def _get_api_key():
@@ -55,8 +56,8 @@ def norm_core(name: str) -> str:
     parts = [p for p in s.split() if p not in GENERIC_WORDS]
     return " ".join(parts)
 
-# ========= ARES SEARCH (v2 REST, zdroj OR) s retry =========
-def ares_query(obchodni_jmeno: str, count: int = ARES_COUNT):
+# ========= ARES v2 JSON (primary) =========
+def ares_query_v2(obchodni_jmeno: str, count: int = ARES_COUNT):
     base = "https://ares.gov.cz/ekonomicke-subjekty-v2/ekonomicke-subjekty"
     params = {
         "obchodniJmeno": obchodni_jmeno,
@@ -64,13 +65,16 @@ def ares_query(obchodni_jmeno: str, count: int = ARES_COUNT):
         "razeni": "obchodniJmeno@asc",
         "zdroj": "OR"
     }
-    headers = {"Accept": "application/json", "User-Agent": UA}
+    headers = {"Accept": "application/json", "Accept-Language": "cs", "User-Agent": UA}
 
     last_err = None
     for attempt in range(3):
         try:
             r = requests.get(base, params=params, headers=headers, timeout=20)
-            r.raise_for_status()
+            # Někdy vrátí HTML/empty – zkontrolujeme Content-Type a tělo
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "json" not in ct:
+                raise ValueError(f"Non-JSON response (status {r.status_code}, content-type {ct})")
             data = r.json()
             items = data.get("ekonomickeSubjekty", []) or data.get("vysledky", [])
             out = []
@@ -83,11 +87,28 @@ def ares_query(obchodni_jmeno: str, count: int = ARES_COUNT):
         except Exception as e:
             last_err = e
             time.sleep(1.2 * (2 ** attempt))
-    st.warning(f"Nepodařilo se připojit k ARES (REST): {last_err}")
-    return []
+    raise RuntimeError(f"ARES v2 JSON failed: {last_err}")
+
+# ========= ARES legacy XML (fallback) =========
+def ares_query_legacy(obchodni_jmeno: str, count: int = ARES_COUNT):
+    url = "https://wwwinfo.mfcr.cz/cgi-bin/ares/darv_bas.cgi"
+    params = {"obch_jm": obchodni_jmeno, "maxpoc": str(count), "jazyk": "cz", "typ_vyhledani": "full"}
+    headers = {"User-Agent": UA}
+    r = requests.get(url, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    # Parsujeme XML
+    ns = {"are": "http://wwwinfo.mfcr.cz/ares/xml_doc/schemas/ares/ares_answer_bas/v_1.0.4"}
+    root = ET.fromstring(r.content)
+    out = []
+    for rec in root.findall(".//are:VBAS", ns):
+        of = rec.findtext("are:OF", default="", namespaces=ns)
+        ico = rec.findtext("are:ICO", default="", namespaces=ns)
+        if of:
+            out.append({"name": of, "ico": ico})
+    return out
 
 def ares_search_robust(candidate: str):
-    """Zkus více variant dotazu: plný název, bez diakritiky, 1–2 slova jádra."""
+    """Zkus více variant a při selhání v2 přepni na legacy XML."""
     queries = []
     full = (candidate or "").strip()
     queries.append(full)
@@ -108,9 +129,13 @@ def ares_search_robust(candidate: str):
             continue
         seen.add(q.lower())
         try:
-            hits += ares_query(q, ARES_COUNT)
+            hits += ares_query_v2(q, ARES_COUNT)
         except Exception:
-            pass
+            # fallback na legacy XML
+            try:
+                hits += ares_query_legacy(q, ARES_COUNT)
+            except Exception:
+                pass
         # deduplikace podle normalizovaného jádra
         dedup = {}
         for h in hits:
@@ -122,7 +147,6 @@ def ares_search_robust(candidate: str):
 
 # ========= SIMILARITY =========
 def max_similarity(candidate: str, corpus: list):
-    """Vezmeme maximum ze 4 různých metrik (opatrnější)."""
     names = [h["name"] for h in corpus]
     if not names:
         return 0, None
@@ -135,7 +159,7 @@ def max_similarity(candidate: str, corpus: list):
             max_s, best_match = score, match
     return max_s, best_match
 
-# ========= NAME GENERATION =========
+# ========= AI generation (stejné jako dřív) =========
 def generate_ai_names(keywords, style, n=10):
     prompt = (
         f"Vymysli {n} originálních názvů firmy, které NEJSOU běžnými českými slovy a nejsou generické.\n"
@@ -172,10 +196,8 @@ def generate_ai_names(keywords, style, n=10):
     return uniq[:n]
 
 def generate_safe_free_names(keywords, style, desired, free_threshold):
-    """Vygeneruje kandidáty a propustí jen ty, které jsou pod zadaným prahem podobnosti."""
     results = []
     attempts = 0
-    # maximálně 6 iterací nenásilně, ať zbytečně netrápíme API
     while len(results) < desired and attempts < 6:
         attempts += 1
         candidates = generate_ai_names(keywords, style, desired)
@@ -202,7 +224,7 @@ with st.expander("⚙️ Nastavení"):
     n = st.slider("Počet výsledků", 5, 30, 10)
     style = st.text_input("Styl (volitelné)", "moderní, stručné, nezaměnitelné")
     free_thr = st.slider("Práh pro 'Volné' (max. podobnost %)", 55, 85, 70)
-    st.caption("Čím nižší práh, tím přísnější filtr (méně návrhů projde). Doporučeno 65–75 %.")
+    st.caption("Čím nižší práh, tím přísnější filtr. Doporučeno 65–75 %.")
 
 keywords = st.text_input("Zadej obor/klíčová slova (např. právní služby, AI školení, kavárna):")
 
@@ -212,10 +234,10 @@ if st.button("Vygenerovat a zkontrolovat"):
         st.stop()
 
     if mode == "Bezpečné názvy (doporučeno)":
-        with st.spinner("🔒 Generuji bezpečné názvy a přísně ověřuji v ARES…"):
+        with st.spinner("🔒 Generuji bezpečné názvy a ověřuji v ARES…"):
             results = generate_safe_free_names(keywords, style, desired=n, free_threshold=free_thr)
         if not results:
-            st.error("Nepodařilo se najít dostatečný počet 'bezpečných' názvů. Zkus snížit práh nebo upřesnit klíčová slova.")
+            st.error("Nepodařilo se najít 'bezpečné' názvy (ARES může dočasně selhávat). Zkuste znovu nebo snížit práh.")
         else:
             st.success("Hotovo. Zde jsou výsledky:")
             st.dataframe(results, use_container_width=True)
